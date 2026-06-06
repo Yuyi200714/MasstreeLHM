@@ -29,6 +29,7 @@ static_assert(sizeof(inode_block_image) == kMetadataBlockBytes,
 struct directory_block_image {
     metadata_common_block_header common;
     directory_block_header header;
+    inode_disk directory_inode;
     uint8_t payload[kDirectoryBlockPayloadBytes];
 };
 static_assert(sizeof(directory_block_image) == kMetadataBlockBytes,
@@ -43,6 +44,18 @@ static_assert(sizeof(directory_block_image) == kMetadataBlockBytes,
 // 当前不实现崩溃恢复流程，只保留布局和最小操作能力。
 class PersistentStore {
   public:
+    struct stats_snapshot {
+        uint64_t block_read_ops = 0;
+        uint64_t block_write_ops = 0;
+        uint64_t bytes_read = 0;
+        uint64_t bytes_written = 0;
+        uint64_t sync_ops = 0;
+        uint64_t fsync_ops = 0;
+        uint64_t allocate_block_ops = 0;
+        uint64_t l0_flush_ops = 0;
+        uint64_t inode_cache_flush_ops = 0;
+    };
+
     PersistentStore();
     ~PersistentStore();
 
@@ -73,6 +86,7 @@ class PersistentStore {
 
     // inode 块与 inode slot 操作。
     bool ReadInodeBlock(uint32_t block_id, inode_block_image& out) const;
+    bool ReadInodeBlockForRefDirect(const inode_ref& ref, inode_block_image& out) const;
     bool WriteInodeBlock(uint32_t block_id, const inode_block_image& image);
     bool AllocateInodeSlot(inode_ref& out_ref);
     bool ReadInode(const inode_ref& ref, inode_disk& out) const;
@@ -81,6 +95,8 @@ class PersistentStore {
     // 目录块操作。
     bool ReadDirectoryBlock(uint32_t block_id, directory_block_image& out) const;
     bool WriteDirectoryBlock(uint32_t block_id, const directory_block_image& image);
+    bool ReadDirectoryInode(uint32_t head_block_id, inode_disk& out) const;
+    bool WriteDirectoryInode(uint32_t head_block_id, const inode_disk& inode);
     bool CreateDirectoryChain(uint64_t dir_inode_id, inode_ref& out_head_ref);
     bool AppendDirectoryChainBlock(const inode_ref& tail_ref,
                                    uint64_t dir_inode_id,
@@ -88,6 +104,8 @@ class PersistentStore {
 
     uint32_t NextAllocBlock() const;
     const std::string& BackingFile() const;
+    void ResetStats();
+    stats_snapshot Stats() const;
 
   private:
     static constexpr uint64_t kInodeAllocChunk = 256;
@@ -141,7 +159,9 @@ class PersistentStore {
     bool InitializeFreshStore();
     bool RecomputeNextAllocBlock();
     bool RecomputeLinearInodeCursor();
+    bool RecomputeNextDirectoryBlock();
     bool AllocateBlockLocked(uint32_t& out_block_id);
+    bool AllocateDirectoryBlockLocked(uint32_t& out_block_id);
     uint64_t NextSequenceLocked();
     void InitDirectoryBlockImage(directory_block_image& out,
                                  uint32_t block_id,
@@ -172,6 +192,10 @@ class PersistentStore {
     bool IsKnownBlockType(uint16_t block_type) const;
     static uint32_t InodeBlockIdFromTicket(uint64_t ticket);
     static uint32_t InodeSlotFromTicket(uint64_t ticket);
+    static uint32_t InodePhysicalBlockId(uint32_t inode_block_id);
+    static uint32_t DirectoryPhysicalBlockId(uint32_t directory_block_id);
+    static uint32_t MaxLogicalInodeBlockId(uint32_t physical_block_count);
+    static uint32_t MaxLogicalDirectoryBlockId(uint32_t physical_block_count);
 
     static bool IsSlotUsed(const inode_block_header& header, uint32_t slot);
     static void SetSlotUsed(inode_block_header& header, uint32_t slot, bool used);
@@ -187,12 +211,22 @@ class PersistentStore {
     int fd_;
     std::string path_;
     std::atomic<uint32_t> next_alloc_block_;
+    std::atomic<uint32_t> next_directory_block_;
     uint64_t sequence_;
     std::atomic<uint64_t> next_inode_ticket_;
     std::atomic<uint32_t> highest_initialized_inode_block_;
     std::atomic<uint64_t> inode_alloc_epoch_;
     std::atomic<uint64_t> l0_epoch_;
     std::atomic<bool> l0_cache_enabled_;
+    mutable std::atomic<uint64_t> stats_block_read_ops_;
+    mutable std::atomic<uint64_t> stats_block_write_ops_;
+    mutable std::atomic<uint64_t> stats_bytes_read_;
+    mutable std::atomic<uint64_t> stats_bytes_written_;
+    mutable std::atomic<uint64_t> stats_sync_ops_;
+    mutable std::atomic<uint64_t> stats_fsync_ops_;
+    mutable std::atomic<uint64_t> stats_allocate_block_ops_;
+    mutable std::atomic<uint64_t> stats_l0_flush_ops_;
+    mutable std::atomic<uint64_t> stats_inode_cache_flush_ops_;
     mutable std::mutex inode_alloc_mu_;
     mutable std::array<inode_block_cache_shard, kInodeCacheShardCount> inode_block_cache_;
     mutable std::mutex l0_buffers_mu_;

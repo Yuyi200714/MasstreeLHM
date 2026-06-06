@@ -85,10 +85,11 @@ enum class inode_type : uint8_t {
 };
 
 // 固定 256B inode，不含名字字段。
-// 名字由目录项维护，rename 时只改目录映射。
+// 当前目录父子关系以 Masstree route tree 为准；目录 embedded inode 不维护
+// parent_inode_id，避免目录迁移引入额外持久化写。
 struct inode_disk {
     uint64_t inode_id;           // inode 全局唯一标识
-    uint64_t parent_inode_id;    // 父目录 inode id（便于 rename 与恢复）
+    uint64_t parent_inode_id;    // 文件可用父目录 inode id；目录 embedded inode 当前置 0
     uint64_t size_bytes;         // 文件大小（目录可用作逻辑统计字段）
     uint64_t ctime_ns;           // 创建/状态变更时间戳（ns）
     uint64_t mtime_ns;           // 内容/目录项变更时间戳（ns）
@@ -158,10 +159,13 @@ struct directory_block_header {
 static_assert(sizeof(directory_block_header) == 64,
               "directory block header must be 64B");
 
+static constexpr uint32_t kDirectoryBlockFlagHasEmbeddedInode = 1u << 0;
+
 static constexpr uint32_t kDirectoryBlockPayloadBytes =
-    kMetadataBlockBytes - kCommonBlockHeaderBytes - sizeof(directory_block_header);
-static_assert(kDirectoryBlockPayloadBytes == 16256,
-              "directory payload must be 16256B for 16KB block");
+    kMetadataBlockBytes - kCommonBlockHeaderBytes - sizeof(directory_block_header)
+    - sizeof(inode_disk);
+static_assert(kDirectoryBlockPayloadBytes == 16000,
+              "directory payload must be 16000B for 16KB block");
 
 enum class directory_delta_op : uint8_t {
     insert = 1,

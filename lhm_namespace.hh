@@ -14,12 +14,16 @@
 #include <vector>
 
 #include "kvthread.hh"
+#include "directory_block_store.hh"
 #include "directory_meta.hh"
 #include "masstree.hh"
 #include "masstree_get.hh"
 #include "masstree_insert.hh"
+#include "masstree_directory_index.hh"
 #include "masstree_remove.hh"
 #include "masstree_scan.hh"
+#include "namespace_path.hh"
+#include "namespace_types.hh"
 #include "path_key.hh"
 #include "persistent_store.hh"
 
@@ -27,140 +31,64 @@
 
 namespace MasstreeLHM {
 
-// entry_kind 描述同一张命名空间表中的最小记录类型。
-// 当前阶段只区分目录和普通文件，为后续 rename 和 inode
-// 外存指针预留扩展空间。
-enum class entry_kind : uint8_t {
-    invalid = 0,
-    directory = 1,
-    file = 2
-};
-
-struct namespace_entry {
-    entry_kind kind;
-    inode_ref ref;
-    uint8_t name_length;
-    char name[kMaxEntryNameBytes + 1];
-};
-
-// readdir_record 描述一次最小目录扫描结果。
-// 当前阶段已经可以同时返回：
-// 1. 完整哈希路径
-// 2. 当前目录下的直接孩子哈希
-// 3. 真实目录项名字
-// 4. 对应 entry
-struct readdir_record {
-    std::vector<uint64_t> full_hashes;
-    uint64_t child_component_hash;
-    std::string child_name;
-    namespace_entry entry;
-};
-
-struct subtree_record {
-    std::vector<uint64_t> full_hashes;
-    namespace_entry entry;
-};
-
-struct directory_root_debug_info {
-    bool found;
-    bool is_leaf;
-    bool has_meta;
-    uint32_t height;
-    int size;
-    bool child0_is_leaf;
-    bool child1_exists;
-    bool child1_is_leaf;
-    int child0_size;
-    int child1_size;
-};
-
-inline std::string entry_name(const namespace_entry& entry) {
-    return std::string(entry.name, entry.name + entry.name_length);
-}
-
-inline std::string_view entry_name_view(const namespace_entry& entry) {
-    return std::string_view(entry.name, entry.name_length);
-}
-
-inline bool entry_name_fits(const std::string& name) {
-    return name.size() <= kMaxEntryNameBytes;
-}
-
-inline namespace_entry make_namespace_entry(entry_kind kind, inode_ref ref,
-                                            const std::string& name) {
-    namespace_entry entry;
-    entry.kind = kind;
-    entry.ref = ref;
-    entry.name_length = static_cast<uint8_t>(name.size());
-    memset(entry.name, 0, sizeof(entry.name));
-    memcpy(entry.name, name.data(), name.size());
-    return entry;
-}
-
-inline bool entry_is_valid(const namespace_entry& entry) {
-    return entry.kind != entry_kind::invalid;
-}
-
-inline bool entry_is_directory(const namespace_entry& entry) {
-    return entry.kind == entry_kind::directory;
-}
-
-inline bool entry_is_file(const namespace_entry& entry) {
-    return entry.kind == entry_kind::file;
-}
-
-inline bool entry_name_equals(const namespace_entry& entry, std::string_view name) {
-    const size_t n = static_cast<size_t>(entry.name_length);
-    return n == name.size() && (n == 0 || memcmp(entry.name, name.data(), n) == 0);
-}
-
-inline const char* entry_kind_name(entry_kind kind) {
-    switch (kind) {
-    case entry_kind::directory:
-        return "directory";
-    case entry_kind::file:
-        return "file";
-    default:
-        return "invalid";
-    }
-}
-
-// 命名空间表的 value 比简单 uint64_t 大得多，尤其在加入固定长度文件名后，
-// 如果仍使用默认宽度，leaf 节点尺寸会超过当前线程池分配器允许的上限。
-// 因此这里先把宽度调小，保证“最小原型 + 文件名承载”能够正常运行。
-struct namespace_table_params : Masstree::nodeparams<7, 7> {
-    using value_type = namespace_entry;
-    using value_print_type = Masstree::value_print<value_type>;
-    using threadinfo_type = ::threadinfo;
-};
+#if defined(__GNUC__) || defined(__clang__)
+#define LHM_NAMESPACE_ALWAYS_INLINE inline __attribute__((always_inline))
+#else
+#define LHM_NAMESPACE_ALWAYS_INLINE inline
+#endif
 
 // LhmNamespace 是第二阶段的薄包装层：
 // 负责把“路径字符串 -> PathKey -> Masstree 操作”这条链路收敛成
 // 更接近文件系统语义的接口。
 class LhmNamespace {
   public:
-    using table_type = Masstree::basic_table<namespace_table_params>;
-    using unlocked_cursor_type = typename table_type::unlocked_cursor_type;
-    using cursor_type = Masstree::tcursor<namespace_table_params>;
-    using value_type = namespace_entry;
+    using value_type = MasstreeDirectoryIndex::value_type;
 
     void initialize(threadinfo& ti) {
-        table_.initialize(ti);
+        directory_index_.initialize(ti);
         initialize_persistence_store();
+        directory_blocks_.bind(persistent_store_);
     }
 
     void destroy(threadinfo& ti) {
         if (persistent_store_.IsOpen()) {
+            (void) directory_blocks_.flush_all();
             (void) persistent_store_.Sync();
             persistent_store_.Close();
         }
         root_persistent_ref_ = make_inode_ref(0, 0);
         root_persistent_ref_valid_ = false;
-        table_.destroy(ti);
+        root_directory_head_block_id_ = 0;
+        root_directory_tail_block_id_ = 0;
+        directory_blocks_.reset();
+        directory_index_.destroy(ti);
     }
 
     const std::string& persistence_backing_file() const {
         return persistent_store_.BackingFile();
+    }
+
+    PersistentStore::stats_snapshot persistence_stats() const {
+        return persistent_store_.Stats();
+    }
+
+    void reset_persistence_stats() {
+        persistent_store_.ResetStats();
+        directory_blocks_.reset_stats();
+    }
+
+    DirectoryBlockStore::stats_snapshot directory_block_stats() const {
+        return directory_blocks_.stats();
+    }
+
+    bool sync_persistence() {
+        if (!persistent_store_.IsOpen()) {
+            return false;
+        }
+        if (!directory_blocks_.flush_all()) {
+            return false;
+        }
+        return persistent_store_.Sync();
     }
 
     // fast 模式用于先打通持久化主链路：
@@ -188,13 +116,62 @@ class LhmNamespace {
     }
 
     // lookup_entry 返回任意类型的命名空间项，根目录 "/" 被视为隐式存在。
-    bool lookup_entry(const std::string& path, value_type& out, threadinfo& ti) const {
+    LHM_NAMESPACE_ALWAYS_INLINE bool lookup_entry(const std::string& path,
+                                                  value_type& out,
+                                                  threadinfo& ti) const {
         ParsedPath parsed = PathKey::parse_absolute_path(path);
         return lookup_entry_from_parsed(parsed, out, ti);
     }
 
+    bool lookup_entry_with_inode_block_direct(const std::string& path,
+                                              value_type& out,
+                                              inode_block_image& inode_block,
+                                              inode_disk* inode_out,
+                                              threadinfo& ti) const {
+        if (!lookup_entry(path, out, ti)) {
+            return false;
+        }
+
+        if (entry_is_directory(out)) {
+            const uint32_t head_block_id =
+                path == "/" ? root_directory_head_block_id_ : out.ref.block_id;
+            if (head_block_id == 0) {
+                return false;
+            }
+            inode_disk directory_inode{};
+            if (!directory_blocks_.read_directory_inode(head_block_id, directory_inode)) {
+                return false;
+            }
+            if (inode_out != nullptr) {
+                *inode_out = directory_inode;
+            }
+            std::memset(&inode_block, 0, sizeof(inode_block));
+            return true;
+        }
+
+        inode_ref ref = out.ref;
+        if (path == "/") {
+            if (!root_persistent_ref_valid_) {
+                return false;
+            }
+            ref = root_persistent_ref_;
+        }
+        if (!persistent_store_.ReadInodeBlockForRefDirect(ref, inode_block)) {
+            return false;
+        }
+        if (inode_out != nullptr) {
+            *inode_out = inode_block.slots[ref.offset];
+            if (inode_out->inode_id != packed_inode_id(ref)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
     // lookup_file 只在目标路径存在且类型为普通文件时返回成功。
-    bool lookup_file(const std::string& path, value_type& out, threadinfo& ti) const {
+    LHM_NAMESPACE_ALWAYS_INLINE bool lookup_file(const std::string& path,
+                                                 value_type& out,
+                                                 threadinfo& ti) const {
         if (!lookup_entry(path, out, ti)) {
             return false;
         }
@@ -202,7 +179,9 @@ class LhmNamespace {
     }
 
     // lookup_directory 只在目标路径存在且类型为目录时返回成功。
-    bool lookup_directory(const std::string& path, value_type& out, threadinfo& ti) const {
+    LHM_NAMESPACE_ALWAYS_INLINE bool lookup_directory(const std::string& path,
+                                                      value_type& out,
+                                                      threadinfo& ti) const {
         if (!lookup_entry(path, out, ti)) {
             return false;
         }
@@ -232,14 +211,11 @@ class LhmNamespace {
             return false;
         }
 
-        inode_ref persistent_ref = make_inode_ref(0, 0);
-        if (!allocate_inode_ref_for_create(ref, persistent_ref)) {
+        if (!create_directory_on_parent_root(parsed, parent_root, ref, ti)) {
             return false;
         }
-        if (!create_directory_on_parent_root(parsed, parent_root, persistent_ref, ti)) {
-            return false;
-        }
-        return persist_create_success(parsed, entry_kind::directory, persistent_ref, parent_ref);
+        (void) parent_ref;
+        return true;
     }
 
     // creat_file（推荐接口）：
@@ -340,14 +316,48 @@ class LhmNamespace {
                 return results;
             }
             const directory_meta* meta = directory_root->directory_meta();
-            if (meta == nullptr || !directory_meta_name_equals(*meta, parsed.components.back())) {
+            if (meta == nullptr) {
                 return results;
             }
         } else {
-            directory_root = table_.root();
+            directory_root = directory_index_.root();
         }
 
-        append_directory_children(directory_root, parsed.hashes, results);
+        directory_index_.append_directory_children(directory_root, parsed.hashes, results);
+        for (readdir_record& record : results) {
+            if (!entry_is_directory(record.entry)) {
+                continue;
+            }
+            std::string child_name;
+            if (directory_blocks_.read_directory_self_name(record.entry.ref.block_id,
+                                                           child_name)) {
+                record.child_name = child_name;
+                record.entry = make_namespace_entry(entry_kind::directory, record.entry.ref,
+                                                    child_name);
+            }
+        }
+
+        uint32_t head = 0;
+        uint32_t tail = 0;
+        if (!directory_block_refs_for_root(directory_root, head, tail)) {
+            return results;
+        }
+        std::vector<DirectoryBlockStore::entry> entries;
+        if (!directory_blocks_.read_entries(head, entries)) {
+            return results;
+        }
+        for (const DirectoryBlockStore::entry& item : entries) {
+            if (item.kind != DirectoryBlockStore::dentry_kind::file) {
+                continue;
+            }
+            readdir_record record;
+            record.full_hashes = parsed.hashes;
+            record.full_hashes.push_back(item.component_hash);
+            record.child_component_hash = item.component_hash;
+            record.child_name = item.name;
+            record.entry = DirectoryBlockStore::to_namespace_entry(item);
+            results.push_back(std::move(record));
+        }
         return results;
     }
 
@@ -489,7 +499,7 @@ class LhmNamespace {
         ParsedPath parsed = PathKey::parse_absolute_path(path);
         const node_type* root = nullptr;
         if (parsed.normalized_path == "/") {
-            root = table_.root();
+            root = directory_index_.root();
         } else if (!locate_directory_root(parsed, root, ti)) {
             out = directory_root_debug_info{false, false, false, 0, 0, false,
                                             false, false, -1, -1};
@@ -531,8 +541,28 @@ class LhmNamespace {
         return true;
     }
 
+    bool debug_file_index_info(const std::string& path,
+                               DirectoryBlockStore::file_index_debug_info& out,
+                               threadinfo& ti) const {
+        ParsedPath parsed = PathKey::parse_absolute_path(path);
+        const node_type* root = nullptr;
+        if (parsed.normalized_path == "/") {
+            root = directory_index_.root();
+        } else if (!locate_directory_root(parsed, root, ti)) {
+            out = DirectoryBlockStore::file_index_debug_info{};
+            return false;
+        }
+        uint32_t head = 0;
+        uint32_t tail = 0;
+        if (!directory_block_refs_for_root(root, head, tail)) {
+            out = DirectoryBlockStore::file_index_debug_info{};
+            return false;
+        }
+        return directory_blocks_.debug_file_index(head, out);
+    }
+
   private:
-    using node_type = typename table_type::node_type;
+    using node_type = MasstreeDirectoryIndex::node_type;
 
     struct rename_plan_item {
         std::string source_path;
@@ -541,159 +571,41 @@ class LhmNamespace {
         size_t depth;
     };
 
-    struct directory_edge_lookup {
-        bool found = false;
-        node_type* child_root = nullptr;
-        value_type entry{};
-    };
+    using directory_edge_lookup = MasstreeDirectoryIndex::directory_edge_lookup;
+    using child_slot_lookup = MasstreeDirectoryIndex::child_slot_lookup;
 
-    struct child_slot_lookup {
-        bool found = false;
-        bool is_layer = false;
-        node_type* child_root = nullptr;
-        value_type value{};
-    };
-
-    struct readdir_scanner {
-        const std::vector<uint64_t>* parent_hashes;
-        std::vector<readdir_record>* out;
-
-        template <typename SS, typename K>
-        void visit_leaf(const SS&, const K&, threadinfo&) {
-        }
-
-        bool visit_value(lcdf::Str key, value_type value, threadinfo&) {
-            std::vector<uint64_t> decoded = PathKey::decode(key);
-            if (decoded.size() != parent_hashes->size() + 1) {
-                return true;
-            }
-            for (size_t i = 0; i < parent_hashes->size(); ++i) {
-                if (decoded[i] != (*parent_hashes)[i]) {
-                    return true;
-                }
-            }
-
-            readdir_record record;
-            record.child_component_hash = decoded.back();
-            record.child_name = entry_name(value);
-            record.full_hashes = decoded;
-            record.entry = value;
-            out->push_back(std::move(record));
-            return true;
-        }
-    };
-
-    struct subtree_scanner {
-        const std::vector<uint64_t>* root_hashes;
-        std::vector<subtree_record>* out;
-
-        template <typename SS, typename K>
-        void visit_leaf(const SS&, const K&, threadinfo&) {
-        }
-
-        bool visit_value(lcdf::Str key, value_type value, threadinfo&) {
-            std::vector<uint64_t> decoded = PathKey::decode(key);
-            if (decoded.size() < root_hashes->size()) {
-                return true;
-            }
-            for (size_t i = 0; i < root_hashes->size(); ++i) {
-                if (decoded[i] != (*root_hashes)[i]) {
-                    return true;
-                }
-            }
-
-            subtree_record record;
-            record.full_hashes = std::move(decoded);
-            record.entry = value;
-            out->push_back(std::move(record));
-            return true;
-        }
-    };
-
-    table_type table_;
+    MasstreeDirectoryIndex directory_index_;
     bool fast_mode_ = true;
     bool l0_cache_enabled_ = true;
     PersistentStore persistent_store_;
+    mutable DirectoryBlockStore directory_blocks_;
     bool persistence_available_ = false;
     std::atomic<uint64_t> transient_inode_cursor_{1};
     inode_ref root_persistent_ref_ = make_inode_ref(0, 0);
     bool root_persistent_ref_valid_ = false;
+    uint32_t root_directory_head_block_id_ = 0;
+    uint32_t root_directory_tail_block_id_ = 0;
 
-    struct single_component_key {
-        char bytes[sizeof(uint64_t)];
-
-        lcdf::Str as_str() const {
-            return lcdf::Str(bytes, sizeof(bytes));
-        }
-    };
+    using single_component_key = MasstreeDirectoryIndex::single_component_key;
 
     static single_component_key make_single_component_key(uint64_t component_hash) {
-        single_component_key key;
-        uint64_t be = host_to_net_order(component_hash);
-        memcpy(key.bytes, &be, sizeof(be));
-        return key;
+        return MasstreeDirectoryIndex::make_single_component_key(component_hash);
     }
 
     static node_type* canonicalize_directory_root(node_type* root) {
-        while (true) {
-            node_type* next = root->maybe_parent();
-            if (next == root) {
-                return root;
-            }
-            root = next;
-        }
+        return MasstreeDirectoryIndex::canonicalize_directory_root(root);
     }
 
     static const node_type* canonicalize_directory_root(const node_type* root) {
-        while (true) {
-            const node_type* next = root->maybe_parent();
-            if (next == root) {
-                return root;
-            }
-            root = next;
-        }
-    }
-
-    bool directory_root_has_children(const node_type* node) const {
-        if (node->isleaf()) {
-            const typename node_type::leaf_type* leaf =
-                static_cast<const typename node_type::leaf_type*>(node);
-            return leaf->size() != 0;
-        }
-
-        const typename node_type::internode_type* in =
-            static_cast<const typename node_type::internode_type*>(node);
-        for (int i = 0; i != in->size() + 1; ++i) {
-            if (in->child_[i] && directory_root_has_children(in->child_[i])) {
-                return true;
-            }
-        }
-        return false;
+        return MasstreeDirectoryIndex::canonicalize_directory_root(root);
     }
 
     static std::string parent_path(const std::string& normalized_path) {
-        if (normalized_path == "/") {
-            return "/";
-        }
-
-        size_t pos = normalized_path.find_last_of('/');
-        if (pos == 0) {
-            return "/";
-        }
-        return normalized_path.substr(0, pos);
+        return NamespacePath::parent_path(normalized_path);
     }
 
     static bool is_prefix_path(const std::string& prefix, const std::string& path) {
-        if (prefix == "/") {
-            return true;
-        }
-        if (path.size() < prefix.size()) {
-            return false;
-        }
-        if (path.compare(0, prefix.size(), prefix) != 0) {
-            return false;
-        }
-        return path.size() == prefix.size() || path[prefix.size()] == '/';
+        return NamespacePath::is_prefix_path(prefix, path);
     }
 
     static std::string hash_path_key(const std::vector<uint64_t>& hashes) {
@@ -758,15 +670,39 @@ class LhmNamespace {
         return (static_cast<uint64_t>(ref.block_id) << 32) | static_cast<uint64_t>(ref.offset);
     }
 
+    static uint64_t packed_directory_inode_id(uint32_t head_block_id) {
+        return (uint64_t{1} << 63) | static_cast<uint64_t>(head_block_id);
+    }
+
     static bool is_zero_inode_ref(const inode_ref& ref) {
         return ref.block_id == 0 && ref.offset == 0;
     }
 
+    static inode_disk make_embedded_directory_inode(uint64_t inode_id,
+                                                    uint32_t head_block_id) {
+        inode_disk inode{};
+        const uint64_t ts = now_ns();
+        inode.inode_id = inode_id;
+        inode.parent_inode_id = 0;
+        inode.primary_ref = make_inode_ref(head_block_id, 0);
+        inode.aux_ref = make_inode_ref(head_block_id, 0);
+        inode.ctime_ns = ts;
+        inode.mtime_ns = ts;
+        inode.tombstone_epoch = 0;
+        inode.stable_version = 1;
+        inode.generation = 1;
+        inode.link_count = 1;
+        inode.mode = 0755;
+        inode.type = static_cast<uint8_t>(inode_type::directory);
+        inode.flags = 0;
+        inode.checksum = 0;
+        return inode;
+    }
+
     bool allocate_inode_ref_for_create(const inode_ref& requested_ref, inode_ref& out_ref) {
-        if (persistence_available_) {
+        if (persistence_available_ && persistent_store_.IsOpen()) {
             return persistent_store_.AllocateInodeSlot(out_ref);
         }
-
         if (!is_zero_inode_ref(requested_ref)) {
             out_ref = requested_ref;
             return true;
@@ -795,10 +731,24 @@ class LhmNamespace {
             }
         }
 
-        if (::mkdir(kPersistenceDir, 0755) != 0 && errno != EEXIST) {
+        std::string persistence_dir = kPersistenceDir;
+        if (const char* env_dir = std::getenv("LHM_PERSISTENCE_DIR")) {
+            if (env_dir[0] != '\0') {
+                persistence_dir = env_dir;
+            }
+        }
+
+        std::string persistence_file = persistence_dir + "/lhm_namespace.meta";
+        if (const char* env_file = std::getenv("LHM_PERSISTENCE_FILE")) {
+            if (env_file[0] != '\0') {
+                persistence_file = env_file;
+            }
+        }
+
+        if (::mkdir(persistence_dir.c_str(), 0755) != 0 && errno != EEXIST) {
             return;
         }
-        if (!persistent_store_.OpenOrCreate(kPersistenceFile)) {
+        if (!persistent_store_.OpenOrCreate(persistence_file)) {
             return;
         }
         if (!persistent_store_.set_l0_cache_enabled(l0_cache_enabled_)) {
@@ -827,6 +777,8 @@ class LhmNamespace {
         }
         root.primary_ref = root_dir_head;
         root.aux_ref = root_dir_head;
+        root_directory_head_block_id_ = root_dir_head.block_id;
+        root_directory_tail_block_id_ = root_dir_head.block_id;
         root.ctime_ns = now_ns();
         root.mtime_ns = root.ctime_ns;
         root.tombstone_epoch = 0;
@@ -837,6 +789,9 @@ class LhmNamespace {
         root.type = static_cast<uint8_t>(inode_type::directory);
         root.flags = 0;
         root.checksum = 0;
+        if (!persistent_store_.WriteDirectoryInode(root_dir_head.block_id, root)) {
+            return false;
+        }
         if (!persistent_store_.WriteInode(root_slot, root)) {
             return false;
         }
@@ -868,6 +823,103 @@ class LhmNamespace {
                                        inode_ref& out,
                                        threadinfo& ti) const {
         return resolve_directory_persistent_ref(parent_path(parsed.normalized_path), out, ti);
+    }
+
+    bool allocate_directory_blocks(uint32_t& head_block_id, uint32_t& tail_block_id) {
+        head_block_id = 0;
+        tail_block_id = 0;
+        if (!persistence_available_ || !persistent_store_.IsOpen()) {
+            return false;
+        }
+        inode_ref head_ref = make_inode_ref(0, 0);
+        if (!persistent_store_.CreateDirectoryChain(0, head_ref)) {
+            return false;
+        }
+        head_block_id = head_ref.block_id;
+        tail_block_id = head_ref.block_id;
+        return true;
+    }
+
+    bool directory_block_refs_for_root(node_type* root, uint32_t& head_block_id,
+                                       uint32_t& tail_block_id,
+                                       directory_meta** meta_out = nullptr) {
+        if (meta_out != nullptr) {
+            *meta_out = nullptr;
+        }
+        if (root == directory_index_.root()) {
+            head_block_id = root_directory_head_block_id_;
+            tail_block_id = root_directory_tail_block_id_;
+            return head_block_id != 0 && tail_block_id != 0;
+        }
+        if (root == nullptr || !root->has_directory_meta()) {
+            return false;
+        }
+        directory_meta* meta = root->directory_meta();
+        if (meta == nullptr || meta->head_block_id == 0 || meta->tail_block_id == 0) {
+            return false;
+        }
+        head_block_id = meta->head_block_id;
+        tail_block_id = meta->tail_block_id;
+        if (meta_out != nullptr) {
+            *meta_out = meta;
+        }
+        return true;
+    }
+
+    bool directory_block_refs_for_root(const node_type* root, uint32_t& head_block_id,
+                                       uint32_t& tail_block_id) const {
+        if (root == directory_index_.root()) {
+            head_block_id = root_directory_head_block_id_;
+            tail_block_id = root_directory_tail_block_id_;
+            return head_block_id != 0 && tail_block_id != 0;
+        }
+        if (root == nullptr || !root->has_directory_meta()) {
+            return false;
+        }
+        const directory_meta* meta = root->directory_meta();
+        if (meta == nullptr || meta->head_block_id == 0 || meta->tail_block_id == 0) {
+            return false;
+        }
+        head_block_id = meta->head_block_id;
+        tail_block_id = meta->tail_block_id;
+        return true;
+    }
+
+    bool insert_dentry_on_directory_root(node_type* directory_root,
+                                         const DirectoryBlockStore::entry& item,
+                                         bool overwrite_existing) {
+        uint32_t head = 0;
+        uint32_t tail = 0;
+        directory_meta* meta = nullptr;
+        if (!directory_block_refs_for_root(directory_root, head, tail, &meta)) {
+            return false;
+        }
+        if (!directory_blocks_.insert(head, tail, item, overwrite_existing)) {
+            return false;
+        }
+        if (directory_root == directory_index_.root()) {
+            root_directory_tail_block_id_ = tail;
+        } else if (meta != nullptr) {
+            meta->tail_block_id = tail;
+        }
+        return true;
+    }
+
+    bool remove_dentry_from_directory_root(node_type* directory_root, uint64_t component_hash,
+                                           const std::string& name) {
+        uint32_t head = 0;
+        uint32_t tail = 0;
+        directory_meta* meta = nullptr;
+        if (!directory_block_refs_for_root(directory_root, head, tail, &meta)) {
+            return false;
+        }
+        if (!directory_blocks_.remove(head, component_hash, name)) {
+            return false;
+        }
+        if (directory_root == directory_index_.root()) {
+            return true;
+        }
+        return true;
     }
 
     bool resolve_parent_creation_context(const ParsedPath& parsed,
@@ -905,62 +957,43 @@ class LhmNamespace {
             return false;
         }
         const directory_meta* meta = parent_root->directory_meta();
-        if (meta == nullptr || !directory_meta_name_equals(*meta, parent.components.back())) {
+        if (meta == nullptr) {
             return false;
         }
-        parent_ref = meta->ref;
+        parent_ref = make_inode_ref(meta->head_block_id, 0);
         return true;
     }
 
     bool create_file_on_parent_root(const ParsedPath& parsed, node_type* parent_root, inode_ref ref,
                                     threadinfo& ti) {
-        value_type entry = make_namespace_entry(entry_kind::file, ref, parsed.components.back());
-        single_component_key key = make_single_component_key(parsed.hashes.back());
-
-        if (fast_mode_) {
-            cursor_type cursor(parent_root, key.as_str().data(), key.as_str().length());
-            bool already_present = cursor.find_insert(ti);
-            if (already_present) {
-                if (cursor.is_layer()) {
-                    cursor.finish_read();
-                    return false;
-                }
-                cursor.value() = entry;
-                fence();
-                cursor.finish(0, ti);
-                return true;
-            }
-            cursor.value() = entry;
-            fence();
-            cursor.finish(1, ti);
-            return true;
-        }
-
-        cursor_type cursor(parent_root, key.as_str().data(), key.as_str().length());
-        bool already_present = cursor.find_insert(ti);
-        if (already_present) {
-            if (cursor.is_layer()) {
-                cursor.finish_read();
-                return false;
-            }
-            cursor.finish(0, ti);
-            return false;
-        }
-        cursor.value() = entry;
-        fence();
-        cursor.finish(1, ti);
-        return true;
+        (void) ti;
+        DirectoryBlockStore::entry entry =
+            DirectoryBlockStore::make_file_entry(parsed.hashes.back(), ref,
+                                                 parsed.components.back());
+        return insert_dentry_on_directory_root(parent_root, entry, fast_mode_);
     }
 
     bool create_directory_on_parent_root(const ParsedPath& parsed, node_type* parent_root,
                                          inode_ref ref, threadinfo& ti) {
-        single_component_key edge_key = make_single_component_key(parsed.hashes.back());
-        cursor_type cursor(parent_root, edge_key.as_str().data(), edge_key.as_str().length());
+        (void) ref;
+        uint32_t head_block_id = 0;
+        uint32_t tail_block_id = 0;
+        if (!allocate_directory_blocks(head_block_id, tail_block_id)) {
+            return false;
+        }
+        const uint64_t dir_inode_id = packed_directory_inode_id(head_block_id);
+        inode_disk embedded_inode = make_embedded_directory_inode(dir_inode_id, head_block_id);
+        if (!persistent_store_.WriteDirectoryInode(head_block_id, embedded_inode)) {
+            return false;
+        }
         node_type* directory_root = nullptr;
-        directory_meta meta = make_directory_meta(ref, parsed.hashes.back(),
-                                                  parsed.components.back());
-
-        if (!cursor.create_layer_with_meta(directory_root, meta, ti)) {
+        directory_meta meta = make_directory_meta(head_block_id, tail_block_id);
+        if (!directory_blocks_.write_directory_self_name(head_block_id, parsed.hashes.back(),
+                                                         parsed.components.back())) {
+            return false;
+        }
+        if (!directory_index_.create_directory_layer(parent_root, parsed.hashes.back(),
+                                                     meta, directory_root, ti)) {
             return false;
         }
         return true;
@@ -974,6 +1007,9 @@ class LhmNamespace {
         if (parsed.normalized_path == "/") {
             return true;
         }
+        if (kind == entry_kind::directory) {
+            return true;
+        }
 
         inode_disk inode{};
         const uint64_t ts = now_ns();
@@ -981,23 +1017,14 @@ class LhmNamespace {
         inode.parent_inode_id = packed_inode_id(parent_ref);
         inode.primary_ref = persistent_ref;
         inode.aux_ref = make_inode_ref(0, 0);
-        if (kind == entry_kind::directory) {
-            inode_ref dir_head = make_inode_ref(0, 0);
-            if (!persistent_store_.CreateDirectoryChain(inode.inode_id, dir_head)) {
-                return false;
-            }
-            inode.primary_ref = dir_head;
-            inode.aux_ref = dir_head;
-        }
         inode.ctime_ns = ts;
         inode.mtime_ns = ts;
         inode.tombstone_epoch = 0;
         inode.stable_version = 1;
         inode.generation = 1;
         inode.link_count = 1;
-        inode.mode = (kind == entry_kind::directory) ? 0755 : 0644;
-        inode.type = static_cast<uint8_t>(
-            kind == entry_kind::directory ? inode_type::directory : inode_type::file);
+        inode.mode = 0644;
+        inode.type = static_cast<uint8_t>(inode_type::file);
         inode.flags = 0;
         inode.checksum = 0;
         return persistent_store_.WriteInode(persistent_ref, inode);
@@ -1005,6 +1032,9 @@ class LhmNamespace {
 
     bool persist_delete_success(const value_type& existing, threadinfo&) {
         if (!persistence_available_) {
+            return true;
+        }
+        if (entry_is_directory(existing)) {
             return true;
         }
 
@@ -1033,6 +1063,9 @@ class LhmNamespace {
         if (!persistence_available_) {
             return true;
         }
+        if (entry_is_directory(moved_entry)) {
+            return true;
+        }
 
         inode_ref parent_ref = make_inode_ref(0, 0);
         if (!resolve_parent_persistent_ref(new_parsed, parent_ref, ti)) {
@@ -1058,19 +1091,7 @@ class LhmNamespace {
 
     bool force_remove_child_slot_fast(node_type* parent_root, uint64_t child_hash,
                                       threadinfo& ti) {
-        single_component_key key = make_single_component_key(child_hash);
-        cursor_type cursor(parent_root, key.as_str().data(), key.as_str().length());
-        cursor.find_locked_edge(ti);
-        int state = cursor.state();
-        if (state < 0 && cursor.is_layer()) {
-            return cursor.remove_layer_edge(ti);
-        }
-        if (state > 0) {
-            cursor.finish(-1, ti);
-            return true;
-        }
-        cursor.finish_read();
-        return true;
+        return directory_index_.force_remove_child_slot(parent_root, child_hash, ti);
     }
 
     bool remove_entry_fast_from_parsed(const ParsedPath& parsed, value_type* removed_out,
@@ -1086,39 +1107,32 @@ class LhmNamespace {
         }
         node_type* parent_root = const_cast<node_type*>(parent_root_const);
 
-        single_component_key key = make_single_component_key(parsed.hashes.back());
-        cursor_type cursor(parent_root, key.as_str().data(), key.as_str().length());
-        cursor.find_locked_edge(ti);
-        int state = cursor.state();
-
-        if (state < 0 && cursor.is_layer()) {
-            if (removed_out != nullptr) {
-                node_type* child_root = canonicalize_directory_root(cursor.layer_root());
-                if (!child_root->has_directory_meta()) {
-                    cursor.finish_read();
-                    return false;
-                }
-                const directory_meta* meta = child_root->directory_meta();
-                if (meta == nullptr) {
-                    cursor.finish_read();
-                    return false;
-                }
-                *removed_out = make_namespace_entry(entry_kind::directory, meta->ref,
-                                                    directory_meta_name(*meta));
+        value_type directory_entry;
+        if (lookup_child_from_parent_root(parent_root, parsed.components.back(),
+                                          parsed.hashes.back(), directory_entry, ti)
+            && entry_is_directory(directory_entry)) {
+            if (!directory_index_.remove_child_slot_fast(parent_root, parsed.hashes.back(),
+                                                         removed_out, ti)) {
+                return false;
             }
-            return cursor.remove_layer_edge(ti);
+            return true;
         }
-        if (state <= 0) {
-            cursor.finish_read();
+
+        DirectoryBlockStore::entry dentry;
+        uint32_t head = 0;
+        uint32_t tail = 0;
+        if (!directory_block_refs_for_root(parent_root, head, tail)) {
             return false;
         }
-
-        value_type slot_value = cursor.value();
-        if (removed_out != nullptr) {
-            *removed_out = slot_value;
+        if (!directory_blocks_.lookup(head, parsed.hashes.back(),
+                                      parsed.components.back(), dentry)) {
+            return false;
         }
-        cursor.finish(-1, ti);
-        return true;
+        if (removed_out != nullptr) {
+            *removed_out = DirectoryBlockStore::to_namespace_entry(dentry);
+        }
+        return remove_dentry_from_directory_root(parent_root, parsed.hashes.back(),
+                                                parsed.components.back());
     }
 
     bool create_entry_fast_from_parsed(const ParsedPath& parsed, entry_kind kind, inode_ref ref,
@@ -1143,26 +1157,10 @@ class LhmNamespace {
             return false;
         }
         node_type* parent_root = const_cast<node_type*>(parent_root_const);
-        value_type entry = make_namespace_entry(kind, ref, parsed.components.back());
-        single_component_key key = make_single_component_key(parsed.hashes.back());
-
-        cursor_type cursor(parent_root, key.as_str().data(), key.as_str().length());
-        bool already_present = cursor.find_insert(ti);
-        if (already_present) {
-            if (cursor.is_layer()) {
-                cursor.finish_read();
-                return false;
-            }
-            cursor.value() = entry;
-            fence();
-            cursor.finish(0, ti);
-            return true;
-        }
-
-        cursor.value() = entry;
-        fence();
-        cursor.finish(1, ti);
-        return true;
+        DirectoryBlockStore::entry entry =
+            DirectoryBlockStore::make_file_entry(parsed.hashes.back(), ref,
+                                                 parsed.components.back());
+        return insert_dentry_on_directory_root(parent_root, entry, true);
     }
 
     bool create_directory_fast_from_parsed(const ParsedPath& parsed, inode_ref ref,
@@ -1185,15 +1183,7 @@ class LhmNamespace {
         }
         node_type* parent_root = const_cast<node_type*>(parent_root_const);
 
-        single_component_key edge_key = make_single_component_key(parsed.hashes.back());
-        cursor_type cursor(parent_root, edge_key.as_str().data(), edge_key.as_str().length());
-        node_type* directory_root = nullptr;
-        directory_meta meta = make_directory_meta(ref, parsed.hashes.back(),
-                                                  parsed.components.back());
-        if (!cursor.create_layer_with_meta(directory_root, meta, ti)) {
-            return false;
-        }
-        return true;
+        return create_directory_on_parent_root(parsed, parent_root, ref, ti);
     }
 
     bool rename_path_fast_from_parsed(const ParsedPath& old_parsed,
@@ -1279,11 +1269,19 @@ class LhmNamespace {
             }
         }
 
-        single_component_key target_edge_key = make_single_component_key(new_parsed.hashes.back());
-        cursor_type attach_cursor(const_cast<node_type*>(new_parent_root_const),
-                                  target_edge_key.as_str().data(),
-                                  target_edge_key.as_str().length());
-        if (!attach_cursor.attach_existing_layer(source_edge.child_root, ti)) {
+        if (!directory_index_.remove_directory_layer(
+                const_cast<node_type*>(old_parent_root_const),
+                old_parsed.hashes.back(),
+                source_edge.child_root,
+                ti)) {
+            return false;
+        }
+
+        if (!directory_index_.attach_existing_directory_layer(
+                const_cast<node_type*>(new_parent_root_const),
+                new_parsed.hashes.back(),
+                source_edge.child_root,
+                ti)) {
             return false;
         }
 
@@ -1294,23 +1292,18 @@ class LhmNamespace {
         if (meta == nullptr) {
             return false;
         }
-        *meta = make_directory_meta(meta->ref, new_parsed.hashes.back(),
-                                    new_parsed.components.back());
+        const uint32_t moved_head = meta->head_block_id;
+        const uint32_t moved_tail = meta->tail_block_id;
+        const uint16_t moved_flags = meta->flags;
+        if (old_parsed.components.back() != new_parsed.components.back()) {
+            if (!directory_blocks_.write_directory_self_name(moved_head,
+                                                             new_parsed.hashes.back(),
+                                                             new_parsed.components.back())) {
+                return false;
+            }
+        }
+        *meta = make_directory_meta(moved_head, moved_tail, moved_flags);
 
-        single_component_key old_edge_key = make_single_component_key(old_parsed.hashes.back());
-        cursor_type detach_cursor(const_cast<node_type*>(old_parent_root_const),
-                                  old_edge_key.as_str().data(),
-                                  old_edge_key.as_str().length());
-        detach_cursor.find_locked_edge(ti);
-        int state = detach_cursor.state();
-        if (state >= 0 || !detach_cursor.is_layer()
-            || detach_cursor.layer_root() != source_edge.child_root) {
-            detach_cursor.finish_read();
-            return false;
-        }
-        if (!detach_cursor.remove_layer_edge(ti)) {
-            return false;
-        }
         return true;
     }
 
@@ -1365,11 +1358,19 @@ class LhmNamespace {
             return false;
         }
 
-        PathKey target_edge_key({new_parsed.hashes.back()});
-        cursor_type attach_cursor(const_cast<node_type*>(new_parent_root_const),
-                                  target_edge_key.as_str().data(),
-                                  target_edge_key.as_str().length());
-        if (!attach_cursor.attach_existing_layer(source_edge.child_root, ti)) {
+        if (!directory_index_.remove_directory_layer(
+                const_cast<node_type*>(old_parent_root_const),
+                old_parsed.hashes.back(),
+                source_edge.child_root,
+                ti)) {
+            return false;
+        }
+
+        if (!directory_index_.attach_existing_directory_layer(
+                const_cast<node_type*>(new_parent_root_const),
+                new_parsed.hashes.back(),
+                source_edge.child_root,
+                ti)) {
             return false;
         }
 
@@ -1380,24 +1381,18 @@ class LhmNamespace {
         if (meta == nullptr) {
             return false;
         }
-        *meta = make_directory_meta(meta->ref, new_parsed.hashes.back(),
-                                    new_parsed.components.back());
+        const uint32_t moved_head = meta->head_block_id;
+        const uint32_t moved_tail = meta->tail_block_id;
+        const uint16_t moved_flags = meta->flags;
+        if (old_parsed.components.back() != new_parsed.components.back()) {
+            if (!directory_blocks_.write_directory_self_name(moved_head,
+                                                             new_parsed.hashes.back(),
+                                                             new_parsed.components.back())) {
+                return false;
+            }
+        }
+        *meta = make_directory_meta(moved_head, moved_tail, moved_flags);
 
-        ParsedPath detach_parent = old_parent;
-        PathKey old_edge_key({old_parsed.hashes.back()});
-        cursor_type detach_cursor(const_cast<node_type*>(old_parent_root_const),
-                                  old_edge_key.as_str().data(),
-                                  old_edge_key.as_str().length());
-        detach_cursor.find_locked_edge(ti);
-        int state = detach_cursor.state();
-        if (state >= 0 || !detach_cursor.is_layer()
-            || detach_cursor.layer_root() != source_edge.child_root) {
-            detach_cursor.finish_read();
-            return false;
-        }
-        if (!detach_cursor.remove_layer_edge(ti)) {
-            return false;
-        }
         return true;
     }
 
@@ -1427,51 +1422,39 @@ class LhmNamespace {
         }
         node_type* parent_root = const_cast<node_type*>(parent_root_const);
 
-        single_component_key key = make_single_component_key(parsed.hashes.back());
-        cursor_type cursor(parent_root, key.as_str().data(), key.as_str().length());
-        cursor.find_locked_edge(ti);
-        int state = cursor.state();
-
-        if (state < 0 && cursor.is_layer()) {
-            node_type* child_root = canonicalize_directory_root(cursor.layer_root());
-            if (!child_root->has_directory_meta()) {
-                cursor.finish_read();
+        value_type directory_entry;
+        if (lookup_child_from_parent_root(parent_root, parsed.components.back(),
+                                          parsed.hashes.back(), directory_entry, ti)
+            && entry_is_directory(directory_entry)) {
+            if (!directory_index_.remove_child_slot_checked(parent_root, parsed.hashes.back(),
+                                                            parsed.components.back(),
+                                                            removed_out, ti)) {
                 return false;
             }
-            const directory_meta* meta = child_root->directory_meta();
-            if (meta == nullptr || !directory_meta_name_equals(*meta, parsed.components.back())) {
-                cursor.finish_read();
-                return false;
-            }
-            if (directory_root_has_children(child_root)) {
-                cursor.finish_read();
-                return false;
-            }
-            if (removed_out != nullptr) {
-                *removed_out = make_namespace_entry(entry_kind::directory, meta->ref,
-                                                    directory_meta_name(*meta));
-            }
-            return cursor.remove_layer_edge(ti);
+            return true;
         }
 
-        if (state <= 0) {
-            cursor.finish_read();
+        DirectoryBlockStore::entry dentry;
+        uint32_t head = 0;
+        uint32_t tail = 0;
+        if (!directory_block_refs_for_root(parent_root, head, tail)) {
             return false;
         }
-
-        value_type slot_value = cursor.value();
-        if (!entry_name_equals(slot_value, parsed.components.back()) || !entry_is_file(slot_value)) {
-            cursor.finish_read();
+        if (!directory_blocks_.lookup(head, parsed.hashes.back(),
+                                      parsed.components.back(), dentry)
+            || dentry.kind != DirectoryBlockStore::dentry_kind::file) {
             return false;
         }
         if (removed_out != nullptr) {
-            *removed_out = slot_value;
+            *removed_out = DirectoryBlockStore::to_namespace_entry(dentry);
         }
-        cursor.finish(-1, ti);
-        return true;
+        return remove_dentry_from_directory_root(parent_root, parsed.hashes.back(),
+                                                parsed.components.back());
     }
 
-    bool lookup_entry_from_parsed(const ParsedPath& parsed, value_type& out, threadinfo& ti) const {
+    LHM_NAMESPACE_ALWAYS_INLINE bool lookup_entry_from_parsed(const ParsedPath& parsed,
+                                                              value_type& out,
+                                                              threadinfo& ti) const {
         if (parsed.normalized_path == "/") {
             out = make_namespace_entry(entry_kind::directory, make_inode_ref(0, 0), "/");
             return true;
@@ -1480,11 +1463,6 @@ class LhmNamespace {
             return false;
         }
 
-        // stat/lookup 走单一路线：
-        // 1) 先只定位到父目录 root；
-        // 2) 再只查最后一级孩子槽位；
-        // 3) 命中 layer 就按目录返回，命中 value 就按文件返回。
-        // 这样避免了旧路径中“先整条路径按目录逐级判断，再走一次 value 查询”的双遍历。
         ParsedPath parent = parsed;
         parent.normalized_path = parent_path(parsed.normalized_path);
         parent.components.pop_back();
@@ -1495,10 +1473,25 @@ class LhmNamespace {
             return false;
         }
 
-        return lookup_child_from_parent_root(const_cast<node_type*>(parent_root_const),
-                                             parsed.components.back(),
-                                             parsed.hashes.back(),
-                                             out, ti);
+        if (lookup_child_from_parent_root(const_cast<node_type*>(parent_root_const),
+                                          parsed.components.back(),
+                                          parsed.hashes.back(),
+                                          out, ti)) {
+            return true;
+        }
+
+        uint32_t head = 0;
+        uint32_t tail = 0;
+        if (!directory_block_refs_for_root(parent_root_const, head, tail)) {
+            return false;
+        }
+        DirectoryBlockStore::entry dentry;
+        if (!directory_blocks_.lookup(head, parsed.hashes.back(),
+                                      parsed.components.back(), dentry)) {
+            return false;
+        }
+        out = DirectoryBlockStore::to_namespace_entry(dentry);
+        return true;
     }
 
     bool create_entry_from_parsed(const ParsedPath& parsed, entry_kind kind, inode_ref ref,
@@ -1530,24 +1523,10 @@ class LhmNamespace {
         }
         node_type* parent_root = const_cast<node_type*>(parent_root_const);
 
-        value_type entry = make_namespace_entry(kind, ref, parsed.components.back());
-        single_component_key key = make_single_component_key(parsed.hashes.back());
-
-        cursor_type cursor(parent_root, key.as_str().data(), key.as_str().length());
-        bool already_present = cursor.find_insert(ti);
-        if (already_present) {
-            if (cursor.is_layer()) {
-                cursor.finish_read();
-                return false;
-            }
-            cursor.finish(0, ti);
-            return false;
-        }
-
-        cursor.value() = entry;
-        fence();
-        cursor.finish(1, ti);
-        return true;
+        DirectoryBlockStore::entry entry =
+            DirectoryBlockStore::make_file_entry(parsed.hashes.back(), ref,
+                                                 parsed.components.back());
+        return insert_dentry_on_directory_root(parent_root, entry, false);
     }
 
     bool create_directory_from_parsed(const ParsedPath& parsed, inode_ref ref, threadinfo& ti) {
@@ -1575,193 +1554,69 @@ class LhmNamespace {
         }
         node_type* parent_root = const_cast<node_type*>(parent_root_const);
 
-        single_component_key edge_key = make_single_component_key(parsed.hashes.back());
-        cursor_type cursor(parent_root, edge_key.as_str().data(), edge_key.as_str().length());
-        node_type* directory_root = nullptr;
-        directory_meta meta = make_directory_meta(ref, parsed.hashes.back(),
-                                                  parsed.components.back());
-        if (!cursor.create_layer_with_meta(directory_root, meta, ti)) {
-            return false;
-        }
-        return true;
+        return create_directory_on_parent_root(parsed, parent_root, ref, ti);
     }
 
     std::vector<subtree_record> scan_subtree(const ParsedPath& root, threadinfo& ti) const {
-        subtree_scanner scanner;
-        std::vector<subtree_record> results;
-        scanner.root_hashes = &root.hashes;
-        scanner.out = &results;
-        table_.scan(lcdf::Str(""), false, scanner, ti);
-        return results;
+        return directory_index_.scan_subtree(root, ti);
     }
 
     // 在父目录对应的 layer root 内，用“最后一级组件哈希 + 真实名字”检查孩子是否已存在。
     // 当前目录和文件都可以复用这条局部查找路径，避免每次都从全局根重新走完整路径。
-    bool lookup_child_from_parent_root(node_type* parent_root, const std::string& child_name,
-                                       uint64_t child_hash, value_type& out,
-                                       threadinfo& ti) const {
-        child_slot_lookup slot;
-        if (!lookup_child_slot_from_parent_root(parent_root, child_hash, slot, ti)) {
-            return false;
-        }
-
-        if (slot.is_layer) {
-            const node_type* child_root = slot.child_root;
-            if (child_root->has_directory_meta()) {
-                const directory_meta* meta = child_root->directory_meta();
-                if (meta != nullptr && directory_meta_name_equals(*meta, child_name)) {
-                    out = make_namespace_entry(entry_kind::directory, meta->ref,
-                                               directory_meta_name(*meta));
-                    return true;
-                }
-            }
-            return false;
-        }
-
-        const value_type& raw = slot.value;
-        if (entry_name_equals(raw, child_name)) {
-            out = raw;
-            return true;
-        }
-        return false;
+    LHM_NAMESPACE_ALWAYS_INLINE bool lookup_child_from_parent_root(
+        node_type* parent_root,
+        const std::string& child_name,
+        uint64_t child_hash,
+        value_type& out,
+        threadinfo& ti) const {
+        return directory_index_.lookup_child_from_parent_root(parent_root, child_name,
+                                                             child_hash, out, ti);
     }
 
-    bool lookup_directory_edge_from_parent_root(node_type* parent_root,
-                                                const std::string& child_name,
-                                                uint64_t child_hash,
-                                                directory_edge_lookup& out,
-                                                threadinfo& ti) const {
-        single_component_key child_key = make_single_component_key(child_hash);
-        cursor_type cursor(parent_root, child_key.as_str().data(), child_key.as_str().length());
-        cursor.find_locked_edge(ti);
-        int state = cursor.state();
-        if (state < 0 && cursor.is_layer()) {
-            node_type* child_root = canonicalize_directory_root(cursor.layer_root());
-            cursor.finish_read();
-            if (!child_root->has_directory_meta()) {
-                return false;
-            }
-            const directory_meta* meta = child_root->directory_meta();
-            if (meta == nullptr || !directory_meta_name_equals(*meta, child_name)) {
-                return false;
-            }
-            out.found = true;
-            out.child_root = child_root;
-            out.entry = make_namespace_entry(entry_kind::directory, meta->ref,
-                                             directory_meta_name(*meta));
-            return true;
-        }
-        cursor.finish_read();
-        return false;
+    LHM_NAMESPACE_ALWAYS_INLINE bool lookup_directory_edge_from_parent_root(
+        node_type* parent_root,
+        const std::string& child_name,
+        uint64_t child_hash,
+        directory_edge_lookup& out,
+        threadinfo& ti) const {
+        return directory_index_.lookup_directory_edge_from_parent_root(parent_root, child_name,
+                                                                      child_hash, out, ti);
     }
 
-    bool lookup_child_slot_from_parent_root(node_type* parent_root, uint64_t child_hash,
-                                            child_slot_lookup& out, threadinfo& ti) const {
-        out = child_slot_lookup{};
-        single_component_key child_key = make_single_component_key(child_hash);
-        unlocked_cursor_type cursor(parent_root, child_key.as_str().data(),
-                                    child_key.as_str().length());
-        cursor.find_unlocked_edge(ti);
-        int state = cursor.state();
-        if (state < 0 && cursor.is_layer()) {
-            out.found = true;
-            out.is_layer = true;
-            out.child_root = canonicalize_directory_root(cursor.layer_root());
-            return true;
-        }
-        if (state <= 0) {
-            return false;
-        }
-        out.found = true;
-        out.value = cursor.value();
-        return true;
+    LHM_NAMESPACE_ALWAYS_INLINE bool lookup_child_slot_from_parent_root(
+        node_type* parent_root,
+        uint64_t child_hash,
+        child_slot_lookup& out,
+        threadinfo& ti) const {
+        return directory_index_.lookup_child_slot_from_parent_root(parent_root, child_hash,
+                                                                  out, ti);
     }
 
-    bool locate_directory_root(const ParsedPath& parsed, const node_type*& out,
-                               threadinfo& ti) const {
-        out = table_.root();
-        if (parsed.normalized_path == "/") {
-            return true;
-        }
-
-        for (uint64_t component_hash : parsed.hashes) {
-            single_component_key edge_key = make_single_component_key(component_hash);
-            unlocked_cursor_type cursor(const_cast<node_type*>(out), edge_key.as_str().data(),
-                                        edge_key.as_str().length());
-            cursor.find_unlocked_edge(ti);
-            int state = cursor.state();
-            if (state >= 0 || !cursor.is_layer()) {
-                return false;
-            }
-            out = canonicalize_directory_root(cursor.layer_root());
-        }
-        return true;
+    LHM_NAMESPACE_ALWAYS_INLINE bool locate_directory_root(const ParsedPath& parsed,
+                                                           const node_type*& out,
+                                                           threadinfo& ti) const {
+        return directory_index_.locate_directory_root(parsed, out, ti);
     }
 
-    void append_directory_children(const node_type* parent_root,
-                                   const std::vector<uint64_t>& parent_hashes,
-                                   std::vector<readdir_record>& out) const {
-        append_directory_children_from_node(parent_root, parent_hashes, out);
-    }
-
-    void append_directory_children_from_node(const node_type* node,
-                                             const std::vector<uint64_t>& parent_hashes,
-                                             std::vector<readdir_record>& out) const {
-        if (node->isleaf()) {
-            const typename node_type::leaf_type* leaf =
-                static_cast<const typename node_type::leaf_type*>(node);
-            typename node_type::leaf_type::permuter_type perm = leaf->permutation();
-            for (int i = 0; i != leaf->size(); ++i) {
-                int p = perm[i];
-                uint64_t child_hash = static_cast<uint64_t>(leaf->ikey(p));
-
-                if (!leaf->is_layer(p)) {
-                    value_type slot_value = leaf->lv_[p].value();
-                    readdir_record record;
-                    record.full_hashes = parent_hashes;
-                    record.full_hashes.push_back(child_hash);
-                    record.child_component_hash = child_hash;
-                    record.child_name = entry_name(slot_value);
-                    record.entry = slot_value;
-                    out.push_back(std::move(record));
-                    continue;
-                }
-
-                // 命中目录 edge 时只恢复当前目录项，不下钻子目录。
-                const node_type* child_root =
-                    canonicalize_directory_root(leaf->lv_[p].layer());
-                if (!child_root->has_directory_meta()) {
-                    continue;
-                }
-                const directory_meta* meta = child_root->directory_meta();
-                if (meta == nullptr) {
-                    continue;
-                }
-                readdir_record record;
-                record.full_hashes = parent_hashes;
-                record.full_hashes.push_back(meta->component_hash);
-                record.child_component_hash = meta->component_hash;
-                record.child_name = directory_meta_name(*meta);
-                record.entry = make_namespace_entry(entry_kind::directory, meta->ref,
-                                                    directory_meta_name(*meta));
-                out.push_back(std::move(record));
-            }
-            return;
-        }
-
-        const typename node_type::internode_type* in =
-            static_cast<const typename node_type::internode_type*>(node);
-        for (int i = 0; i != in->size() + 1; ++i) {
-            if (in->child_[i]) {
-                append_directory_children_from_node(in->child_[i], parent_hashes, out);
-            }
-        }
-    }
 };
 
 }  // namespace MasstreeLHM
 
+#undef LHM_NAMESPACE_ALWAYS_INLINE
+
 namespace Masstree {
+
+template <>
+class value_print<MasstreeLHM::route_value> {
+  public:
+    static void print(MasstreeLHM::route_value value, FILE* f, const char* prefix,
+                      int indent, Str key, kvtimestamp_t, char* suffix) {
+        fprintf(f, "%s%*s%.*s = {kind=%s, ref=(block=%" PRIu32 ", offset=%" PRIu32 ")}%s\n",
+                prefix, indent, "", key.len, key.s,
+                MasstreeLHM::entry_kind_name(value.kind),
+                value.ref.block_id, value.ref.offset, suffix);
+    }
+};
 
 template <>
 class value_print<MasstreeLHM::namespace_entry> {

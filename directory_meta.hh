@@ -2,14 +2,14 @@
 #define MASSTREELHM_DIRECTORY_META_HH
 
 #include <stdint.h>
-#include <string.h>
 #include <string>
 #include <string_view>
 
 namespace MasstreeLHM {
 
-// 当前目录项和目录 root 元数据都复用同一份最小名字长度约束。
-static constexpr size_t kMaxEntryNameBytes = 63;
+// Match common POSIX filesystem NAME_MAX semantics.  The in-memory Masstree
+// route stores component hashes; names are kept in dentry blocks/API records.
+static constexpr size_t kMaxEntryNameBytes = 255;
 
 // inode_ref 模拟未来 DMB 中的物理地址引用。
 // 当前阶段仍然使用 block_id + offset 作为最小占位表示。
@@ -25,35 +25,51 @@ inline inode_ref make_inode_ref(uint32_t block_id, uint32_t offset) {
     return ref;
 }
 
-// directory_meta 是方案 A 中“目录 root 尾随元数据”的最小结构。
-// 它描述的是目录对象自身身份，而不是目录中的某个普通叶子项。
-struct directory_meta {
-    inode_ref ref;
-    uint64_t component_hash;
-    uint8_t name_length;
-    uint8_t flags;
-    char name[kMaxEntryNameBytes + 1];
+using block_id_t = uint32_t;
+
+struct directory_ref {
+    block_id_t block_id;
 };
 
-inline directory_meta make_directory_meta(inode_ref ref, uint64_t component_hash,
-                                          const std::string& name) {
+inline directory_ref make_directory_ref(block_id_t block_id) {
+    directory_ref ref;
+    ref.block_id = block_id;
+    return ref;
+}
+
+// directory_meta 是 Masstree 目录 route root 的内存热元数据。
+// 真实目录名与目录 inode 存在该目录自己的 directory block 中；父目录
+// dentry block 不再重复保存子目录 entry。
+struct directory_meta {
+    uint32_t head_block_id;
+    uint32_t tail_block_id;
+    uint16_t flags;
+    uint16_t layout_version;
+    uint32_t reserved;
+};
+static_assert(sizeof(directory_meta) == 16, "directory_meta must stay 16B");
+
+inline directory_meta make_directory_meta(uint32_t head_block_id,
+                                          uint32_t tail_block_id,
+                                          uint16_t flags = 0) {
     directory_meta meta;
-    meta.ref = ref;
-    meta.component_hash = component_hash;
-    meta.name_length = static_cast<uint8_t>(name.size());
-    meta.flags = 0;
-    memset(meta.name, 0, sizeof(meta.name));
-    memcpy(meta.name, name.data(), name.size());
+    meta.head_block_id = head_block_id;
+    meta.tail_block_id = tail_block_id;
+    meta.flags = flags;
+    meta.layout_version = 1;
+    meta.reserved = 0;
     return meta;
 }
 
 inline std::string directory_meta_name(const directory_meta& meta) {
-    return std::string(meta.name, meta.name + meta.name_length);
+    (void) meta;
+    return std::string();
 }
 
 inline bool directory_meta_name_equals(const directory_meta& meta, std::string_view name) {
-    const size_t n = static_cast<size_t>(meta.name_length);
-    return n == name.size() && (n == 0 || memcmp(meta.name, name.data(), n) == 0);
+    (void) meta;
+    (void) name;
+    return true;
 }
 
 }  // namespace MasstreeLHM

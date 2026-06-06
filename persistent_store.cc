@@ -79,9 +79,14 @@ thread_local PersistentStore::inode_chunk_cache PersistentStore::tls_inode_chunk
 thread_local PersistentStore::l0_tls_handle PersistentStore::tls_l0_handle_{};
 
 PersistentStore::PersistentStore()
-    : fd_(-1), next_alloc_block_(1), sequence_(1), next_inode_ticket_(0),
+    : fd_(-1), next_alloc_block_(1), next_directory_block_(1), sequence_(1),
+      next_inode_ticket_(0),
       highest_initialized_inode_block_(0), inode_alloc_epoch_(1), l0_epoch_(1),
-      l0_cache_enabled_(true) {
+      l0_cache_enabled_(true),
+      stats_block_read_ops_(0), stats_block_write_ops_(0),
+      stats_bytes_read_(0), stats_bytes_written_(0), stats_sync_ops_(0),
+      stats_fsync_ops_(0), stats_allocate_block_ops_(0), stats_l0_flush_ops_(0),
+      stats_inode_cache_flush_ops_(0) {
 }
 
 PersistentStore::~PersistentStore() {
@@ -95,6 +100,7 @@ PersistentStore::~PersistentStore() {
 
 bool PersistentStore::OpenOrCreate(const std::string& path) {
     Close();
+    ResetStats();
     // 当前阶段统一采用 direct I/O，绕过页缓存。
     int fd = ::open(path.c_str(), O_RDWR | O_CREAT | O_DIRECT, 0644);
     if (fd < 0) {
@@ -104,6 +110,7 @@ bool PersistentStore::OpenOrCreate(const std::string& path) {
     fd_ = fd;
     path_ = path;
     next_alloc_block_.store(1, std::memory_order_relaxed);
+    next_directory_block_.store(1, std::memory_order_relaxed);
     sequence_ = 1;
     next_inode_ticket_.store(0, std::memory_order_relaxed);
     highest_initialized_inode_block_.store(0, std::memory_order_relaxed);
@@ -139,7 +146,9 @@ void PersistentStore::Close() {
             (void) FlushAllL0Buffers();
         }
         (void) FlushInodeCache();
-        (void) ::fsync(fd_);
+        if (::fsync(fd_) == 0) {
+            stats_fsync_ops_.fetch_add(1, std::memory_order_relaxed);
+        }
         ::close(fd_);
         fd_ = -1;
     }
@@ -148,6 +157,7 @@ void PersistentStore::Close() {
     ResetInodeCache();
     path_.clear();
     next_alloc_block_.store(1, std::memory_order_relaxed);
+    next_directory_block_.store(1, std::memory_order_relaxed);
     sequence_ = 1;
     next_inode_ticket_.store(0, std::memory_order_relaxed);
     highest_initialized_inode_block_.store(0, std::memory_order_relaxed);
@@ -170,7 +180,12 @@ bool PersistentStore::Sync() {
     if (!FlushInodeCache()) {
         return false;
     }
-    return ::fsync(fd_) == 0;
+    stats_sync_ops_.fetch_add(1, std::memory_order_relaxed);
+    if (::fsync(fd_) != 0) {
+        return false;
+    }
+    stats_fsync_ops_.fetch_add(1, std::memory_order_relaxed);
+    return true;
 }
 
 bool PersistentStore::set_l0_cache_enabled(bool enabled) {
@@ -206,6 +221,8 @@ bool PersistentStore::ReadBlock(uint32_t block_id, metadata_block_bytes& out) co
     bool ok = pread_all(fd_, aligned, kMetadataBlockBytes, block_offset(block_id));
     if (ok) {
         std::memcpy(out.data(), aligned, kMetadataBlockBytes);
+        stats_block_read_ops_.fetch_add(1, std::memory_order_relaxed);
+        stats_bytes_read_.fetch_add(kMetadataBlockBytes, std::memory_order_relaxed);
     }
     ::free(aligned);
     return ok;
@@ -226,6 +243,8 @@ bool PersistentStore::WriteBlock(uint32_t block_id, const metadata_block_bytes& 
     bool ok = pwrite_all(fd_, aligned, kMetadataBlockBytes, block_offset(block_id));
     ::free(aligned);
     if (ok) {
+        stats_block_write_ops_.fetch_add(1, std::memory_order_relaxed);
+        stats_bytes_written_.fetch_add(kMetadataBlockBytes, std::memory_order_relaxed);
         uint32_t need = block_id + 1;
         uint32_t cur = next_alloc_block_.load(std::memory_order_relaxed);
         while (cur < need
@@ -343,6 +362,17 @@ bool PersistentStore::ReadInodeBlock(uint32_t block_id, inode_block_image& out) 
     }
 
     return ReadInodeBlockDirect(block_id, out);
+}
+
+bool PersistentStore::ReadInodeBlockForRefDirect(const inode_ref& ref,
+                                                 inode_block_image& out) const {
+    if (ref.offset >= kInodesPerBlock) {
+        return false;
+    }
+    if (!IsOpen()) {
+        return false;
+    }
+    return ReadInodeBlockDirect(ref.block_id, out);
 }
 
 bool PersistentStore::WriteInodeBlock(uint32_t block_id, const inode_block_image& image) {
@@ -506,7 +536,7 @@ bool PersistentStore::WriteInode(const inode_ref& ref, const inode_disk& inode) 
 
 bool PersistentStore::ReadDirectoryBlock(uint32_t block_id, directory_block_image& out) const {
     metadata_block_bytes block;
-    if (!ReadBlock(block_id, block)) {
+    if (!ReadBlock(DirectoryPhysicalBlockId(block_id), block)) {
         return false;
     }
     std::memcpy(&out, block.data(), sizeof(out));
@@ -521,7 +551,33 @@ bool PersistentStore::WriteDirectoryBlock(uint32_t block_id,
                                           const directory_block_image& image) {
     metadata_block_bytes block{};
     std::memcpy(block.data(), &image, sizeof(image));
-    return WriteBlock(block_id, block);
+    return WriteBlock(DirectoryPhysicalBlockId(block_id), block);
+}
+
+bool PersistentStore::ReadDirectoryInode(uint32_t head_block_id, inode_disk& out) const {
+    directory_block_image image{};
+    if (!ReadDirectoryBlock(head_block_id, image)) {
+        return false;
+    }
+    if ((image.header.flags & kDirectoryBlockFlagHasEmbeddedInode) == 0) {
+        return false;
+    }
+    out = image.directory_inode;
+    return true;
+}
+
+bool PersistentStore::WriteDirectoryInode(uint32_t head_block_id,
+                                          const inode_disk& inode) {
+    directory_block_image image{};
+    if (!ReadDirectoryBlock(head_block_id, image)) {
+        return false;
+    }
+    image.directory_inode = inode;
+    image.header.dir_inode_id = inode.inode_id;
+    image.header.flags |= kDirectoryBlockFlagHasEmbeddedInode;
+    image.common.owner_inode_id = inode.inode_id;
+    image.common.sequence = NextSequenceLocked();
+    return WriteDirectoryBlock(head_block_id, image);
 }
 
 bool PersistentStore::CreateDirectoryChain(uint64_t dir_inode_id, inode_ref& out_head_ref) {
@@ -532,7 +588,7 @@ bool PersistentStore::CreateDirectoryChain(uint64_t dir_inode_id, inode_ref& out
 
     std::lock_guard<std::mutex> guard(inode_alloc_mu_);
     uint32_t block_id = 0;
-    if (!AllocateBlockLocked(block_id)) {
+    if (!AllocateDirectoryBlockLocked(block_id)) {
         return false;
     }
 
@@ -568,7 +624,7 @@ bool PersistentStore::AppendDirectoryChainBlock(const inode_ref& tail_ref,
     }
 
     uint32_t new_block_id = 0;
-    if (!AllocateBlockLocked(new_block_id)) {
+    if (!AllocateDirectoryBlockLocked(new_block_id)) {
         return false;
     }
 
@@ -595,6 +651,33 @@ uint32_t PersistentStore::NextAllocBlock() const {
 
 const std::string& PersistentStore::BackingFile() const {
     return path_;
+}
+
+void PersistentStore::ResetStats() {
+    stats_block_read_ops_.store(0, std::memory_order_relaxed);
+    stats_block_write_ops_.store(0, std::memory_order_relaxed);
+    stats_bytes_read_.store(0, std::memory_order_relaxed);
+    stats_bytes_written_.store(0, std::memory_order_relaxed);
+    stats_sync_ops_.store(0, std::memory_order_relaxed);
+    stats_fsync_ops_.store(0, std::memory_order_relaxed);
+    stats_allocate_block_ops_.store(0, std::memory_order_relaxed);
+    stats_l0_flush_ops_.store(0, std::memory_order_relaxed);
+    stats_inode_cache_flush_ops_.store(0, std::memory_order_relaxed);
+}
+
+PersistentStore::stats_snapshot PersistentStore::Stats() const {
+    stats_snapshot out;
+    out.block_read_ops = stats_block_read_ops_.load(std::memory_order_relaxed);
+    out.block_write_ops = stats_block_write_ops_.load(std::memory_order_relaxed);
+    out.bytes_read = stats_bytes_read_.load(std::memory_order_relaxed);
+    out.bytes_written = stats_bytes_written_.load(std::memory_order_relaxed);
+    out.sync_ops = stats_sync_ops_.load(std::memory_order_relaxed);
+    out.fsync_ops = stats_fsync_ops_.load(std::memory_order_relaxed);
+    out.allocate_block_ops = stats_allocate_block_ops_.load(std::memory_order_relaxed);
+    out.l0_flush_ops = stats_l0_flush_ops_.load(std::memory_order_relaxed);
+    out.inode_cache_flush_ops =
+        stats_inode_cache_flush_ops_.load(std::memory_order_relaxed);
+    return out;
 }
 
 bool PersistentStore::EnsureBlockCount(uint32_t block_count) {
@@ -626,6 +709,7 @@ bool PersistentStore::InitializeFreshStore() {
     }
 
     next_alloc_block_.store(1, std::memory_order_relaxed);
+    next_directory_block_.store(1, std::memory_order_relaxed);
     sequence_ = 1;
     next_inode_ticket_.store(0, std::memory_order_relaxed);
     highest_initialized_inode_block_.store(0, std::memory_order_relaxed);
@@ -662,7 +746,10 @@ bool PersistentStore::RecomputeNextAllocBlock() {
         return false;
     }
     sequence_ = common->sequence + 1;
-    return RecomputeLinearInodeCursor();
+    if (!RecomputeLinearInodeCursor()) {
+        return false;
+    }
+    return RecomputeNextDirectoryBlock();
 }
 
 bool PersistentStore::RecomputeLinearInodeCursor() {
@@ -671,9 +758,10 @@ bool PersistentStore::RecomputeLinearInodeCursor() {
 
     // 启动阶段允许一次线性扫描，用于恢复“最后一个 inode block + 下一个 slot”游标。
     const uint32_t total_blocks = next_alloc_block_.load(std::memory_order_relaxed);
-    for (uint32_t b = 1; b < total_blocks; ++b) {
+    const uint32_t max_inode_block = MaxLogicalInodeBlockId(total_blocks);
+    for (uint32_t b = 1; b <= max_inode_block; ++b) {
         metadata_block_bytes raw;
-        if (!ReadBlock(b, raw)) {
+        if (!ReadBlock(InodePhysicalBlockId(b), raw)) {
             continue;
         }
         const auto* common =
@@ -704,10 +792,49 @@ bool PersistentStore::RecomputeLinearInodeCursor() {
     return true;
 }
 
+bool PersistentStore::RecomputeNextDirectoryBlock() {
+    uint32_t highest_directory_block = 0;
+    const uint32_t total_blocks = next_alloc_block_.load(std::memory_order_relaxed);
+    const uint32_t max_directory_block = MaxLogicalDirectoryBlockId(total_blocks);
+    for (uint32_t b = 1; b <= max_directory_block; ++b) {
+        metadata_block_bytes raw;
+        if (!ReadBlock(DirectoryPhysicalBlockId(b), raw)) {
+            continue;
+        }
+        const auto* common =
+            reinterpret_cast<const metadata_common_block_header*>(raw.data());
+        if (common->magic != kMetadataMagic
+            || common->block_type != static_cast<uint16_t>(metadata_block_type::directory_block)) {
+            continue;
+        }
+        highest_directory_block = std::max(highest_directory_block, b);
+        if (common->sequence >= sequence_) {
+            sequence_ = common->sequence + 1;
+        }
+    }
+    next_directory_block_.store(highest_directory_block + 1, std::memory_order_relaxed);
+    return true;
+}
+
 bool PersistentStore::AllocateBlockLocked(uint32_t& out_block_id) {
     out_block_id = next_alloc_block_.load(std::memory_order_relaxed);
     next_alloc_block_.store(out_block_id + 1, std::memory_order_relaxed);
-    return EnsureBlockCount(out_block_id + 1);
+    const bool ok = EnsureBlockCount(out_block_id + 1);
+    if (ok) {
+        stats_allocate_block_ops_.fetch_add(1, std::memory_order_relaxed);
+    }
+    return ok;
+}
+
+bool PersistentStore::AllocateDirectoryBlockLocked(uint32_t& out_block_id) {
+    out_block_id = next_directory_block_.load(std::memory_order_relaxed);
+    next_directory_block_.store(out_block_id + 1, std::memory_order_relaxed);
+    const uint32_t physical_block_id = DirectoryPhysicalBlockId(out_block_id);
+    const bool ok = EnsureBlockCount(physical_block_id + 1);
+    if (ok) {
+        stats_allocate_block_ops_.fetch_add(1, std::memory_order_relaxed);
+    }
+    return ok;
 }
 
 uint64_t PersistentStore::NextSequenceLocked() {
@@ -734,6 +861,7 @@ void PersistentStore::InitDirectoryBlockImage(directory_block_image& out,
     out.header.delta_count = 0;
     out.header.flags = 0;
     std::memset(out.header.reserved, 0, sizeof(out.header.reserved));
+    std::memset(&out.directory_inode, 0, sizeof(out.directory_inode));
     std::memset(out.payload, 0, sizeof(out.payload));
 }
 
@@ -837,10 +965,12 @@ PersistentStore::l0_thread_buffer* PersistentStore::GetL0ThreadBufferIfValid() c
 }
 
 bool PersistentStore::FlushL0ThreadBufferLocked(l0_thread_buffer& buffer, bool keep_active_block) {
+    bool flushed = false;
     if (buffer.has_active_block && buffer.active_dirty) {
         if (!WriteInodeBlock(buffer.active_block_id, buffer.active_image)) {
             return false;
         }
+        flushed = true;
     }
     buffer.active_dirty = false;
     buffer.pending_ops = 0;
@@ -848,6 +978,9 @@ bool PersistentStore::FlushL0ThreadBufferLocked(l0_thread_buffer& buffer, bool k
         buffer.has_active_block = false;
         buffer.active_block_id = 0;
         std::memset(&buffer.active_image, 0, sizeof(buffer.active_image));
+    }
+    if (flushed) {
+        stats_l0_flush_ops_.fetch_add(1, std::memory_order_relaxed);
     }
     return true;
 }
@@ -891,7 +1024,7 @@ void PersistentStore::ResetAllL0Buffers() {
 
 bool PersistentStore::ReadInodeBlockDirect(uint32_t block_id, inode_block_image& out) const {
     metadata_block_bytes block;
-    if (!ReadBlock(block_id, block)) {
+    if (!ReadBlock(InodePhysicalBlockId(block_id), block)) {
         return false;
     }
     std::memcpy(&out, block.data(), sizeof(out));
@@ -905,7 +1038,7 @@ bool PersistentStore::ReadInodeBlockDirect(uint32_t block_id, inode_block_image&
 bool PersistentStore::WriteInodeBlockDirect(uint32_t block_id, const inode_block_image& image) {
     metadata_block_bytes block{};
     std::memcpy(block.data(), &image, sizeof(image));
-    return WriteBlock(block_id, block);
+    return WriteBlock(InodePhysicalBlockId(block_id), block);
 }
 
 bool PersistentStore::FlushInodeCacheEntryLocked(inode_block_cache_shard& shard,
@@ -920,6 +1053,7 @@ bool PersistentStore::FlushInodeCacheEntryLocked(inode_block_cache_shard& shard,
     }
     entry.dirty = false;
     SetShardDirtyBit(shard, slot_index, false);
+    stats_inode_cache_flush_ops_.fetch_add(1, std::memory_order_relaxed);
     return true;
 }
 
@@ -1001,6 +1135,25 @@ uint32_t PersistentStore::InodeBlockIdFromTicket(uint64_t ticket) {
 
 uint32_t PersistentStore::InodeSlotFromTicket(uint64_t ticket) {
     return static_cast<uint32_t>(ticket % static_cast<uint64_t>(kInodesPerBlock));
+}
+
+uint32_t PersistentStore::InodePhysicalBlockId(uint32_t inode_block_id) {
+    return inode_block_id * 2u - 1u;
+}
+
+uint32_t PersistentStore::DirectoryPhysicalBlockId(uint32_t directory_block_id) {
+    return directory_block_id * 2u;
+}
+
+uint32_t PersistentStore::MaxLogicalInodeBlockId(uint32_t physical_block_count) {
+    return physical_block_count / 2u;
+}
+
+uint32_t PersistentStore::MaxLogicalDirectoryBlockId(uint32_t physical_block_count) {
+    if (physical_block_count == 0) {
+        return 0;
+    }
+    return (physical_block_count - 1u) / 2u;
 }
 
 bool PersistentStore::IsKnownBlockType(uint16_t block_type) const {
